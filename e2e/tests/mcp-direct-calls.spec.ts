@@ -13,9 +13,12 @@ import { McpClient } from "../support/mcp-client.ts";
 import { appsManifest } from "../support/apps-release.ts";
 import { Target } from "../support/platform.ts";
 
-const source = `import { defineApp, mutation, query, object, string, router } from "apps";
+const source = `import { defineApp, mutation, query, object, string, literal, jsonSchema, router } from "apps";
 import { always } from "apps/operations/approval";
+const color = jsonSchema({ type: "string", enum: ["red", "blue"] });
 export default defineApp({}, async () => ({ tools: router({
+  paint: query({ input: object({ nested: color, literalField: literal("red") }), output: object({ nested: color }) },
+    async (_ctx, { nested }) => ({ nested })),
   echo: query({ input: object({ text: string() }), description: "Echo text back to the caller" },
     async (_ctx, { text }) => ({ text })),
   oversized: query({ input: object({}), description: "Return more than 100,000 bytes" },
@@ -132,6 +135,44 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
         // An unknown path lists the closest paths, nearest first.
         expect(described.missing.map((entry) => entry.path)).toEqual([`${echo}x`]);
         expect(described.missing[0]?.matches[0]).toBe(echo);
+
+        const api = yield* Api;
+        const actors = yield* Actors;
+        const paint = `tools[${JSON.stringify(app.slug)}].paint`;
+        const ObjectDocument = Schema.Struct({
+          properties: Schema.Record(Schema.String, Schema.Unknown),
+        });
+        const advertised = yield* body(
+          Schema.Struct({ inputSchema: ObjectDocument, outputSchema: ObjectDocument }),
+          yield* api.request(
+            actors.owner,
+            "GET",
+            `/api/organizations/${organization}/apps/${app.id}/tools/paint`,
+          ),
+        );
+        const color = { type: "string", enum: ["red", "blue"] };
+        expect(advertised.inputSchema.properties.nested).toEqual(color);
+        expect(advertised.inputSchema.properties.literalField).toEqual({
+          type: "string",
+          enum: ["red"],
+        });
+        expect(advertised.outputSchema.properties.nested).toEqual(color);
+        const painted = yield* Schema.decodeUnknownEffect(DescribeResult)(
+          yield* tool("Describe a nested imported schema", "describe", { paths: [paint] }),
+        );
+        expect(painted.items[0]?.signature.match(/nested: "red" \| "blue"/g)).toHaveLength(2);
+        for (const nested of ["blue", "green"]) {
+          const result = yield* api.request(
+            actors.owner,
+            "POST",
+            `/api/organizations/${organization}/apps/${app.id}/tools/call`,
+            { tool: "paint", input: { nested, literalField: "red" } },
+          );
+          if (nested === "blue") {
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            expect(result.body).toEqual({ nested: "blue" });
+          } else expect(result.status).toBe(422);
+        }
 
         // One call returns its outcome alone.
         const single = yield* Schema.decodeUnknownEffect(Completed)(

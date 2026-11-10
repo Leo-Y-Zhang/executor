@@ -52,6 +52,16 @@ version the host ships.
 In this repository, playground workspaces use `"apps": "workspace:*"` for development;
 replace that workspace reference with a released version before deploying.
 
+`jsonSchema(document)` retains its discovery document inside `object`, `array`,
+`record`, `.optional()` and `.default()`, alongside the original validator.
+Composition shares compatible `$defs` at the parent root. Conflicting definitions,
+legacy `definitions` and references to an imported root are relocated with their
+references rewritten, so definition names and document IDs cannot collide.
+Nested schema nodes omit `$schema` and `$id`; annotation values stay intact.
+Nested imports must use draft 2020-12 or omit `$schema`. Other declared dialects
+are rejected when composing the schema because removing their dialect could change
+validation semantics; they remain supported as top-level imports.
+
 `liveOpenapiRouter` reads an OpenAPI document through `ctx.cache`. Generated
 imports retain a source URL, allowed origin, and static credential bindings in
 `openapi.json`. The framework compiles a revision on a cache miss. It writes each

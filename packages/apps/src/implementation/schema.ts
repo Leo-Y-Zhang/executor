@@ -140,14 +140,23 @@ export function wrap<T, Optional extends boolean>(
     [Decoder]: decoder,
     optionalValue,
     parse: (input) => Effect.runSync(parse(decoder, input)),
-    optional: () => wrap(EffectSchema.optional(decoder), true),
+    optional: () => wrap(inheritJsonSchemaDocument(EffectSchema.optional(decoder), decoder), true),
     default: (value) => {
       const parsed = Effect.runSync(parse(decoder, value));
       return {
         ...wrap(
-          decoder
-            .annotate({ default: parsed })
-            .pipe(EffectSchema.withDecodingDefault(Effect.succeed(parsed))),
+          inheritJsonSchemaDocument(
+            decoder
+              .annotate({ default: parsed })
+              .pipe(EffectSchema.withDecodingDefault(Effect.succeed(parsed))),
+            decoder,
+            (document) => ({
+              ...document,
+              ...(parsed === undefined
+                ? {}
+                : { default: EffectSchema.decodeUnknownSync(EffectSchema.Json)(parsed) }),
+            }),
+          ),
           false,
         ),
         hasDefault: true,
@@ -173,14 +182,17 @@ export const boolean = (): Schema<boolean> => wrap(EffectSchema.Boolean, false);
 /** Any JSON value. Values still cross the native JSON decoder. */
 export const json = (): Schema<EffectSchema.Json> => wrap(EffectSchema.Json, false);
 /** Named values with a common schema. */
-export const record = <T>(value: Schema<T, boolean>): Schema<Readonly<Record<string, T>>> =>
-  wrap(
-    EffectSchema.Record(
-      EffectSchema.String,
-      decoderOf(schemaArgument(value, "The record() value")),
+export const record = <T>(value: Schema<T, boolean>): Schema<Readonly<Record<string, T>>> => {
+  const item = decoderOf(schemaArgument(value, "The record() value"));
+  return wrap(
+    withComposedJsonSchema(
+      EffectSchema.Record(EffectSchema.String, item),
+      [[() => "#/additionalProperties", item]],
+      ([schema]) => ({ type: "object", additionalProperties: schema! }),
     ),
     false,
   );
+};
 /** One exact JSON scalar value. */
 export function literal<const T extends string | number | boolean | null>(value: T): Schema<T>;
 export function literal(
@@ -193,8 +205,20 @@ export function literal(
   );
 }
 /** An array whose elements use the given schema. */
-export const array = <T>(item: Schema<T, boolean>): Schema<readonly T[]> =>
-  wrap(EffectSchema.Array(decoderOf(schemaArgument(item, "The array() item"))), false);
+export const array = <T>(item: Schema<T, boolean>): Schema<readonly T[]> => {
+  const decoder = decoderOf(schemaArgument(item, "The array() item"));
+  return wrap(
+    withComposedJsonSchema(
+      EffectSchema.Array(decoder),
+      [[() => "#/items", decoder]],
+      ([schema]) => ({
+        type: "array",
+        items: schema!,
+      }),
+    ),
+    false,
+  );
+};
 
 /** Parse declared fields and omit undeclared fields. */
 export function object<const F extends Fields>(fields: F): ObjectSchema<F> {
@@ -220,7 +244,24 @@ export function object<const F extends Fields>(fields: F): ObjectSchema<F> {
         )
       : EffectSchema.Struct(Object.fromEntries(entries))
   ) as EffectSchema.Decoder<ObjectValue<F>>;
-  return { ...wrap(decoder, false), fields: Object.freeze({ ...fields }) };
+  return {
+    ...wrap(
+      withComposedJsonSchema(
+        decoder,
+        entries.map(([key, field]) => [
+          () =>
+            `#/properties/${encodeURIComponent(key.replaceAll("~", "~0").replaceAll("/", "~1"))}`,
+          field,
+        ]),
+        (schemas) => ({
+          ...EffectSchema.toJsonSchemaDocument(decoder).schema,
+          properties: Object.fromEntries(entries.map(([key], index) => [key, schemas[index]!])),
+        }),
+      ),
+      false,
+    ),
+    fields: Object.freeze({ ...fields }),
+  };
 }
 
 const Exposure: unique symbol = Symbol("apps.FieldExposure");
@@ -291,6 +332,7 @@ export type SecretFields<F extends Fields> = {
 export type SecretObject<T> = { readonly [Key in keyof T]: Sealed<T[Key]> };
 
 const ImportedJsonSchema = Symbol("apps.JsonSchemaDocument");
+const importedDialects = new WeakMap<object, string>();
 
 /** Read the original document for an imported decoder without a lossy schema round trip. */
 export const importedJsonSchema = (decoder: EffectSchema.Decoder<unknown>): unknown | undefined =>
@@ -318,6 +360,49 @@ export const withLazyJsonSchemaDocument = <S extends EffectSchema.Decoder<unknow
     enumerable: true,
     get: once(document),
   });
+
+/** Optional/default wrappers keep the imported document and its dialect without compiling it. */
+const inheritJsonSchemaDocument = <S extends EffectSchema.Decoder<unknown>>(
+  decoder: S,
+  source: EffectSchema.Decoder<unknown>,
+  document: (schema: JsonObject) => JsonObject = (schema) => schema,
+): S => {
+  const dialect = importedDialects.get(source);
+  if (dialect !== undefined) importedDialects.set(decoder, dialect);
+  return ImportedJsonSchema in source
+    ? withLazyJsonSchemaDocument(decoder, () =>
+        document(Effect.runSync(jsonSchemaDocument(source))),
+      )
+    : decoder;
+};
+
+/**
+ * Native composition cannot see documents attached to imported decoders. Compose their
+ * discovery documents lazily, using the same definition sharing and reference relocation as
+ * account routers. Validation continues to use the original native decoders.
+ */
+const withComposedJsonSchema = <S extends EffectSchema.Decoder<unknown>>(
+  decoder: S,
+  children: readonly (readonly [() => string, EffectSchema.Decoder<unknown>])[],
+  document: (schemas: readonly JsonObject[]) => JsonObject,
+): S => {
+  for (const [, child] of children) {
+    const dialect = importedDialects.get(child);
+    if (dialect !== undefined && dialect !== "https://json-schema.org/draft/2020-12/schema")
+      throw new TypeError(
+        "Nested jsonSchema() documents must use draft 2020-12 or omit $schema. Other dialects are supported only at the root.",
+      );
+  }
+  return children.some(([, child]) => ImportedJsonSchema in child)
+    ? withLazyJsonSchemaDocument(decoder, () => {
+        const { $defs, schemas } = combineJsonSchemas(
+          children.map(([, child]) => Effect.runSync(jsonSchemaDocument(child))),
+          (index) => children[index]![0](),
+        );
+        return { ...document(schemas), ...($defs === undefined ? {} : { $defs }) };
+      })
+    : decoder;
+};
 
 /**
  * Relocate a self-contained JSON Schema under a document pointer. Resolve references
@@ -363,7 +448,7 @@ export const nestJsonSchema = (input: JsonObject, pointer: string): JsonObject =
     const refs = references.get(value);
     return Object.fromEntries(
       Object.entries(value)
-        .filter(([key]) => refs === undefined || !["$id", "id", "$anchor"].includes(key))
+        .filter(([key]) => refs === undefined || !["$schema", "$id", "id", "$anchor"].includes(key))
         .map(([key, item]) => [key, refs?.[key] ?? rewrite(item)]),
     );
   };
@@ -447,7 +532,7 @@ export const combineJsonSchemas = (
         configurable: true,
       });
     }
-    const { $defs: _, ...rest } = schema;
+    const { $defs: _, $schema: _dialect, ...rest } = schema;
     return rest;
   });
   return texts.size === 0 ? { schemas: combined } : { $defs: shared, schemas: combined };
@@ -1497,10 +1582,9 @@ export const jsonSchemaDecoder = (input: unknown) =>
 export const jsonSchema = (input: unknown): Schema<EffectSchema.Json> => {
   const document = jsonDocument(input);
   if (document === undefined) throw new ValidationError();
-  return wrap(
-    lazyDecoder(() => document),
-    false,
-  );
+  const decoder = lazyDecoder(() => document);
+  if (typeof document.$schema === "string") importedDialects.set(decoder, document.$schema);
+  return wrap(decoder, false);
 };
 
 /** Render a decoder as a JSON Schema document, keeping an imported upstream document as-is. */
