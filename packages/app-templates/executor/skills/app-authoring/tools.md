@@ -87,7 +87,10 @@ function ([accounts.md](accounts.md#check-an-account)). Keys start with a
 letter or `_` and contain no dots; `__proto__`, `constructor` and `prototype` are
 reserved. Mount each mutation at one path. Router options are `title`,
 `description`, `instructions`, `icons` and `tags` (tag name to description).
-Agents see each router's title and description beside its tools.
+Agents see each router's title and description beside its tools. Search shows
+the first line of a tool's description and of a router's description, up to 200
+characters, and `describe` returns a tool's description whole, so lead with the
+sentence that matters.
 
 `instructions` become a skill read through the MCP `skills` tool. Router skills
 have their own names: `tools` for the root router and `tools-<path>` below it,

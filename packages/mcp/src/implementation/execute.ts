@@ -389,17 +389,17 @@ const signature = (schemas: RenderedSchemas) =>
 
 const cut = (text: string, characters: number) =>
   text.length <= characters ? text : `${text.slice(0, characters - 1)}…`;
+/** The first non-empty line of a description, as long as search shows it, or none when blank. */
+const firstLine = (description: string) => {
+  const line = description
+    .split("\n")
+    .map((text) => text.trim())
+    .find((text) => text !== "");
+  return line === undefined ? undefined : cut(line, defaultSearchLimits.descriptionChars);
+};
 /** The first line of a tool's description, or its title when it has none. */
 const summary = (tool: AppTool) =>
-  cut(
-    tool.description
-      .split("\n")
-      .map((line) => line.trim())
-      .find((line) => line !== "") ??
-      tool.title ??
-      "",
-    defaultSearchLimits.descriptionChars,
-  );
+  firstLine(tool.description) ?? cut(tool.title ?? "", defaultSearchLimits.descriptionChars);
 
 /** An app's namespace, as results list it once. */
 const targetNamespace = (target: Place): SearchNamespace => ({
@@ -407,22 +407,29 @@ const targetNamespace = (target: Place): SearchNamespace => ({
   app: target.app,
   ...(target.accounts === undefined ? {} : { accounts: target.accounts }),
 });
-/** The namespaces a tool's path sits in: its app, and its router when that has a title. */
+/**
+ * The namespaces a tool's path sits in: its app, and its router when that has a title or a
+ * description. The router's description is listed by its first line, as a tool's is.
+ */
 const namespacesOf = (
   target: Place,
   router: ToolRouter | undefined,
-): ReadonlyArray<SearchNamespace> => [
-  targetNamespace(target),
-  ...(router?.title === undefined
-    ? []
-    : [
-        {
-          path: CodeMode.toolExpression(`${target.path}.${toolPath(router.path)}`),
-          app: target.app,
-          router: router.title,
-        },
-      ]),
-];
+): ReadonlyArray<SearchNamespace> => {
+  const description = router?.description === undefined ? undefined : firstLine(router.description);
+  return [
+    targetNamespace(target),
+    ...(router === undefined || (router.title === undefined && description === undefined)
+      ? []
+      : [
+          {
+            path: CodeMode.toolExpression(`${target.path}.${toolPath(router.path)}`),
+            app: target.app,
+            ...(router.title === undefined ? {} : { router: router.title }),
+            ...(description === undefined ? {} : { description }),
+          },
+        ]),
+  ];
+};
 /** The router an entry's tool is listed under. */
 const routerOf = (entry: Entry) =>
   entry.tool.router === undefined ? undefined : entry.target.routers.get(entry.tool.router);
@@ -579,8 +586,8 @@ const fill = <A, B, E>(
 
 /**
  * One page of `tools.search`: exact callable paths, one-line descriptions and input types, with
- * each app and titled router listed once. `remaining` and `next` count from the last item the
- * page holds.
+ * each app and each router that has a title or description listed once. `remaining` and `next`
+ * count from the last item the page holds.
  */
 const searchPage = <E extends Error>(
   searchable: Searchable<E>,

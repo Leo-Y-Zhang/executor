@@ -348,7 +348,7 @@ export const ResumeTool = McpTool.make("resume", {
 export const SearchLimits = Schema.Struct({
   /** Items a page holds when the caller gives no limit. */
   defaultItems: Schema.Int.check(Schema.isGreaterThan(0)),
-  /** Characters kept from the first line of a tool's description. */
+  /** Characters kept from the first line of a tool's or router's description. */
   descriptionChars: Schema.Int.check(Schema.isGreaterThan(0)),
   /** Characters kept from a tool's single-line input type. A longer type is cut and marked. */
   inputChars: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -385,7 +385,7 @@ export const SearchInput = Schema.Struct({
 });
 /**
  * A namespace that search items share, listed once per result rather than in every item: an app
- * with its linked accounts, or a titled router inside it.
+ * with its linked accounts, or a router inside it that has a title or a description.
  */
 export const SearchNamespace = Schema.Struct({
   /** The callable prefix of every tool below it, such as tools.axiom. */
@@ -395,6 +395,8 @@ export const SearchNamespace = Schema.Struct({
   accounts: Schema.optionalKey(Schema.String),
   /** The title of the router that groups these tools. */
   router: Schema.optionalKey(Schema.String),
+  /** The first line of the router's description. */
+  description: Schema.optionalKey(Schema.String),
 });
 export type SearchNamespace = typeof SearchNamespace.Type;
 /** One tool, short enough that a page of them fits in an execute result. */

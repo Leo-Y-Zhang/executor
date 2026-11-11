@@ -28,6 +28,10 @@ const instructions = "Search the docs before answering. Cite the page you used."
 const startDoc = "Start time in unix milliseconds, not an ISO 8601 string.";
 const statusDoc = "One of: draft, open, paid.";
 
+/** Router descriptions that search shows by their first non-empty line, cut to 200 characters. */
+const archiveDoc = "\n  Closed issues  \nKept for a year after closing.";
+const reportsDoc = `Reports ${"and summaries ".repeat(20).trim()}`;
+
 /** An MCP server that describes itself during initialization. One tool name contains a dot. */
 const docsServer = Effect.gen(function* () {
   const routes = Layer.mergeAll(
@@ -149,6 +153,17 @@ export default defineApp({}, async ({ signal, cache, fetch }) => ({
       notes: router({ read: query({ input: object({}) }, async () => "nested") }, { instructions: "Nested notes." }),
     }),
     issue_notes: router({ read: query({ input: object({}) }, async () => "flat") }, { instructions: "Flat notes." }),
+    archive: router({ list: query({ input: object({}) }, async () => []) }, {
+      title: "Archive", description: ${JSON.stringify(archiveDoc)},
+    }),
+    reports: router({ list: query({ input: object({}) }, async () => []) }, {
+      title: "Reports", description: ${JSON.stringify(reportsDoc)},
+    }),
+    labels: router({ list: query({ input: object({}) }, async () => []) }, { title: "Labels" }),
+    milestones: router({ list: query({ input: object({}) }, async () => []) }, {
+      title: "Milestones", description: ${JSON.stringify(" \n\t ")},
+    }),
+    drafts: router({ list: query({ input: object({}) }, async () => []) }, { description: "Unsent drafts" }),
     docs: await mcpRouter({ url: ${JSON.stringify(docs)}, signal }),
     offline: router(await mcpRouter({ url: ${JSON.stringify(offline)}, signal }), {
       description: "A server that is down",
@@ -200,7 +215,12 @@ const Executed = Schema.Struct({
 const Search = Schema.Struct({
   items: Schema.Array(Schema.Struct({ path: Schema.String, description: Schema.String })),
   namespaces: Schema.Array(
-    Schema.Struct({ path: Schema.String, router: Schema.optional(Schema.String) }),
+    Schema.Struct({
+      path: Schema.String,
+      app: Schema.String,
+      router: Schema.optional(Schema.String),
+      description: Schema.optional(Schema.String),
+    }),
   ),
 });
 const Described = Schema.Struct({
@@ -245,13 +265,18 @@ layer(HostedLive, { excludeTestServices: true })("App routers", (it) => {
         const catalog = yield* body(Catalog, listed);
         expect(catalog.items.map((tool) => tool.name)).toEqual([
           "api.invoices.listInvoices",
+          "archive.list",
           "docs.lookup",
           "docs.search.pages",
+          "drafts.list",
           "health",
           "issue.notes.read",
           "issue_notes.read",
           "issues.close",
           "issues.list",
+          "labels.list",
+          "milestones.list",
+          "reports.list",
         ]);
         const tool = (name: string) => catalog.items.find((item) => item.name === name);
         expect(tool("issues.close")).toMatchObject({ router: "issues", readOnly: false });
@@ -449,13 +474,58 @@ export default defineApp({}, async ({ signal }) => ({
           `return await tools.search({ query: "List open issues", namespace: ${JSON.stringify(app.slug)} });`,
         );
         const found = yield* Schema.decodeUnknownEffect(Search)(search.execution.value);
-        // The router's title is listed once, with the namespace its tools share.
+        // The router's title and description are listed once, with the namespace its tools share.
         expect(found.items.find((item) => item.path.endsWith(".issues.list"))?.description).toBe(
           "List open issues",
         );
         expect(found.namespaces).toContainEqual(
-          expect.objectContaining({ path: expect.stringMatching(/\.issues$/), router: "Issues" }),
+          expect.objectContaining({
+            path: expect.stringMatching(/\.issues$/),
+            router: "Issues",
+            description: "Issue triage",
+          }),
         );
+        // Search and describe list each router by its title and the first line of its
+        // description, cut as a tool's is. A blank description is left out, and a router with
+        // neither is not listed.
+        const grouped = yield* execute(
+          "Search and describe every grouped tool",
+          `const found = await tools.search({ namespace: ${JSON.stringify(app.slug)}, limit: 50 });
+const described = await tools.search.describe({ paths: found.items.map((item) => item.path) });
+return { paths: found.items.map((item) => item.path), found: found.namespaces, described: described.namespaces };`,
+        );
+        const spaces = yield* Schema.decodeUnknownEffect(
+          Schema.Struct({
+            paths: Schema.Array(Schema.String),
+            found: Search.fields.namespaces,
+            described: Search.fields.namespaces,
+          }),
+        )(grouped.execution.value);
+        const health = spaces.paths.find((item) => item.endsWith(".health")) ?? "";
+        const appPath = health.slice(0, -".health".length);
+        const grouping = (key: string, labels: { router?: string; description?: string }) => ({
+          path: `${appPath}.${key}`,
+          app: expect.any(String),
+          ...labels,
+        });
+        const groupings = [
+          { path: appPath, app: expect.any(String) },
+          grouping("issues", { router: "Issues", description: "Issue triage" }),
+          grouping("docs", {
+            router: "Docs fixture",
+            description: "Searchable product documentation",
+          }),
+          grouping("api", { router: "Billing API", description: "Invoices and refunds" }),
+          grouping("archive", { router: "Archive", description: "Closed issues" }),
+          grouping("reports", { router: "Reports", description: `${reportsDoc.slice(0, 199)}…` }),
+          grouping("labels", { router: "Labels" }),
+          grouping("milestones", { router: "Milestones" }),
+          grouping("drafts", { description: "Unsent drafts" }),
+        ];
+        for (const listed of [spaces.found, spaces.described]) {
+          expect(listed).toHaveLength(groupings.length);
+          expect(listed).toEqual(expect.arrayContaining(groupings));
+        }
         // The type an agent reads from describe must accept what the same MCP tool returns.
         const docsTools = yield* execute(
           "Describe and call the MCP server's tools",
