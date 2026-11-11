@@ -432,6 +432,11 @@ const jsonBytes = (value: unknown) => encoder.encode(JSON.stringify(value)).byte
 /** One `.name` or `["name"]` member of a tool expression. */
 const expressionMember =
   /^(?:\.([A-Za-z_$][\w$]*)|\[("(?:[^"\\]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*")\])/;
+/** String paths may spell the app's DNS slug after `tools.`, even when it is not a JS identifier. */
+const dottedApp = (name: string) => {
+  const slug = /^tools\.([^.[\]]+)/.exec(name)?.[1];
+  return Schema.is(AppSlug)(slug) ? slug : undefined;
+};
 /**
  * The canonical path of a name an agent passes: a tool expression such as
  * `tools["my-app"].issues` becomes `my-app.issues`, and `tools` alone
@@ -442,7 +447,12 @@ const canonical = (name: string) => {
   if (trimmed !== "tools" && !trimmed.startsWith("tools.") && !trimmed.startsWith("tools["))
     return trimmed;
   const segments: Array<string> = [];
-  for (let rest = trimmed.slice("tools".length); rest !== "";) {
+  const slug = dottedApp(trimmed);
+  if (slug !== undefined) segments.push(slug);
+  for (
+    let rest = trimmed.slice(slug === undefined ? "tools".length : `tools.${slug}`.length);
+    rest !== "";
+  ) {
     const member = expressionMember.exec(rest);
     if (member === null) return trimmed;
     const [matched, identifier, quoted] = member;
@@ -450,6 +460,41 @@ const canonical = (name: string) => {
     rest = rest.slice(matched.length);
   }
   return segments.join(".");
+};
+
+/** A dotted hyphenated app path in source is subtraction; suggest its spelling without rewriting code. */
+const programBracketHint = (code: string, error: CodeMode.Diagnostic) => {
+  if (
+    error.kind !== "UnknownTool" &&
+    error.kind !== "ExecutionFailure" &&
+    error.kind !== "ParseError"
+  )
+    return undefined;
+  try {
+    let previous: Token | undefined;
+    for (const token of tokenizer(code, { ecmaVersion: "latest" })) {
+      const member = previous?.type === tokTypes.dot || previous?.type === tokTypes.questionDot;
+      previous = token;
+      if (token.type !== tokTypes.name || code.slice(token.start, token.end) !== "tools" || member)
+        continue;
+      const source = code.slice(token.start);
+      const slug = /^tools\.([a-z0-9-]+)(?![\w$-])/.exec(source)?.[1];
+      if (slug === undefined || !slug.includes("-") || !Schema.is(AppSlug)(slug)) continue;
+      const unknown = unknownPath(error);
+      if (unknown !== undefined && unknown.split(".")[0] !== slug.split("-")[0]) continue;
+      let path = `tools.${slug}`;
+      for (let rest = source.slice(path.length); rest !== "";) {
+        const member = expressionMember.exec(rest)?.[0];
+        if (member === undefined) break;
+        path += member;
+        rest = rest.slice(member.length);
+      }
+      return canonical(path);
+    }
+  } catch {
+    // Leave syntax errors to CodeMode.
+  }
+  return undefined;
 };
 /** Whether a canonical path lies in a canonical namespace. */
 const within = (path: string, namespace: string) =>
@@ -1739,11 +1784,25 @@ function runProgram(
       const unknown =
         result.ok || unavailable !== undefined ? undefined : prepared.unknownTool(result.error);
       if (unknown !== undefined && !result.ok) yield* prepared.recheck(result.error);
+      const dotted = result.ok ? undefined : programBracketHint(code, result.error);
+      const bracket =
+        dotted === undefined ||
+        prepared.reachable(new Set([dotted.split(".")[0] ?? ""])).length === 0
+          ? undefined
+          : CodeMode.toolExpression(dotted);
       const execution = executionDiagnostic({
         ...result,
-        ...(unknown === undefined || result.ok
+        ...((unknown === undefined && bracket === undefined) || result.ok
           ? {}
-          : { error: { ...result.error, suggestions: [unknown] } }),
+          : {
+              error: {
+                ...result.error,
+                ...(unknown === undefined ? {} : { suggestions: [unknown] }),
+                ...(bracket === undefined
+                  ? {}
+                  : { message: `${result.error.message} Did you mean ${bracket}?` }),
+              },
+            }),
         ...(unavailable === undefined
           ? {}
           : {
@@ -1861,7 +1920,7 @@ export function callTools(input: typeof CallInput.Type): Program {
               return callFailure(
                 request.path,
                 "UnknownTool",
-                `No tool at ${request.path}. Use search to find exact paths.`,
+                `No tool at ${request.path}.${path !== request.path.trim() && dottedApp(request.path.trim())?.includes("-") === true ? ` Did you mean ${CodeMode.toolExpression(path)}?` : ""} Use search to find exact paths.`,
                 closest.map((match) => CodeMode.toolExpression(match)),
               );
             }

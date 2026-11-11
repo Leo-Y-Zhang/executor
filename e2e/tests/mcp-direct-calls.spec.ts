@@ -18,6 +18,10 @@ import { always } from "apps/operations/approval";
 export default defineApp({}, async () => ({ tools: router({
   echo: query({ input: object({ text: string() }), description: "Echo text back to the caller" },
     async (_ctx, { text }) => ({ text })),
+  sources: router({
+    add: query({ input: object({ text: string() }), description: "Return the supplied source text" },
+      async (_ctx, { text }) => ({ text })),
+  }),
   oversized: query({ input: object({}), description: "Return more than 100,000 bytes" },
     async () => ({ data: "x".repeat(150000) })),
   review: mutation({ input: object({ note: string() }), approval: always(), description: "Record a reviewed note" },
@@ -142,6 +146,82 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
           value: { path: echo, ok: true, value: { text: "hi" } },
           toolCalls: [{ name: echo, outcome: "success" }],
         });
+
+        // String paths accept DNS slugs, while programs must use JavaScript brackets.
+        expect(app.slug).toContain("-");
+        const dotted = `tools.${app.slug}.sources.add`;
+        const bracket = `tools[${JSON.stringify(app.slug)}].sources.add`;
+        const forms = [
+          dotted,
+          bracket,
+          `${app.slug}.sources.add`,
+          `tools[${JSON.stringify(app.slug)}]["sources"]["add"]`,
+          `tools[${JSON.stringify(app.slug).replaceAll("-", "\\u002d")}].sources["add"]`,
+        ];
+        const aliases = yield* Schema.decodeUnknownEffect(DescribeResult)(
+          yield* tool("Describe hyphenated paths", "describe", { paths: forms }),
+        );
+        expect(aliases.items.map((item) => item.path)).toEqual(forms.map(() => bracket));
+        expect(aliases.missing).toEqual([]);
+        const called = yield* Schema.decodeUnknownEffect(Completed)(
+          yield* tool("Call hyphenated paths", "call", {
+            calls: forms.map((path) => ({ path, input: { text: "source" } })),
+          }),
+        );
+        expect(called.execution.value).toEqual(
+          forms.map(() => ({ path: bracket, ok: true, value: { text: "source" } })),
+        );
+
+        const typo = `${dotted}x`;
+        const missing = yield* Schema.decodeUnknownEffect(DescribeResult)(
+          yield* tool("Describe a hyphenated typo", "describe", { paths: [typo] }),
+        );
+        expect(missing.missing[0]?.matches[0]).toBe(bracket);
+        const invalid = [
+          typo,
+          `${dotted} + 1`,
+          `tools.${app.slug}.sources..add`,
+          `tools.${app.slug}-.sources.add`,
+          `tools.${app.slug}-missing.sources.add`,
+        ];
+        const rejected = yield* Schema.decodeUnknownEffect(Completed)(
+          yield* tool("Reject unknown hyphenated paths", "call", {
+            calls: invalid.map((path) => ({ path, input: { text: "unknown" } })),
+          }),
+        );
+        expect(rejected.execution.toolCalls).toEqual([]);
+        expect(rejected.execution.value).toMatchObject(
+          invalid.map((path) => ({ path, ok: false, error: { kind: "UnknownTool" } })),
+        );
+        expect(rejected.execution.value).toMatchObject([
+          {
+            error: { message: expect.stringContaining(`Did you mean ${bracket}x?`) },
+            matches: [bracket, expect.any(String), expect.any(String)],
+          },
+          ...invalid.slice(1).map(() => ({})),
+        ]);
+
+        const invalidProgram = yield* tool("Explain JavaScript subtraction", "execute", {
+          code: `return await ${dotted}({ text: "program" });`,
+        });
+        expect(invalidProgram).toMatchObject({
+          execution: {
+            ok: false,
+            error: { message: expect.stringContaining(`Did you mean ${bracket}?`) },
+            toolCalls: [],
+          },
+        });
+        const bracketProgram = yield* Schema.decodeUnknownEffect(Completed)(
+          yield* tool("Execute the bracket form", "execute", {
+            code: `return await ${bracket}({ text: "program" });`,
+          }),
+        );
+        expect(bracketProgram.execution).toMatchObject({ ok: true, value: { text: "program" } });
+        const unrelated = yield* tool("Leave quoted paths alone", "execute", {
+          code: `// ${dotted}\nconst path = ${JSON.stringify(dotted)}; return await tools.no_such_app();`,
+        });
+        expect(unrelated).toMatchObject({ execution: { ok: false } });
+        expect(JSON.stringify(unrelated)).not.toContain(`Did you mean ${bracket}?`);
 
         // A batch keeps its order, one call failing does not stop the others, and a result over
         // 100,000 bytes comes back whole.
